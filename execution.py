@@ -202,23 +202,10 @@ def execute_open(
     quantity = notional / current_price
 
     entry_side = "BUY" if action == "BUY" else "SELL"
-    close_side = "SELL" if action == "BUY" else "BUY"
 
-    # 1. Market entry
+    # Market entry — NO SL/TP orders. Claude manages exits.
     entry_resp = place_market_order(entry_side, quantity)
     entry_price = float(entry_resp.get("avgPrice", current_price))
-
-    # 2. Stop-loss
-    try:
-        place_stop_loss(close_side, sl_price, quantity)
-    except Exception as exc:
-        print(f"[EXEC] Warning: failed to place SL — {exc}")
-
-    # 3. Take-profit
-    try:
-        place_take_profit(close_side, tp_price, quantity)
-    except Exception as exc:
-        print(f"[EXEC] Warning: failed to place TP — {exc}")
 
     return {
         "entry_price": entry_price,
@@ -227,6 +214,34 @@ def execute_open(
         "leverage": leverage,
         "stop_loss": sl_price,
         "take_profit": tp_price,
+    }
+
+
+def execute_add(
+    decision: dict,
+    balance: float,
+    current_price: float,
+) -> dict:
+    """
+    Add to an existing winning position (pyramid).
+    Uses the same leverage already set.
+    """
+    action = decision["action"]  # BUY or SELL
+    size_pct = float(decision.get("add_size_percent", 30))
+    leverage = int(decision.get("leverage", 10))
+
+    notional = balance * (size_pct / 100) * leverage
+    quantity = notional / current_price
+
+    entry_side = "BUY" if action == "BUY" else "SELL"
+    entry_resp = place_market_order(entry_side, quantity)
+    entry_price = float(entry_resp.get("avgPrice", current_price))
+
+    return {
+        "entry_price": entry_price,
+        "quantity": _round_qty(quantity),
+        "side": entry_side,
+        "leverage": leverage,
     }
 
 

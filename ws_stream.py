@@ -21,10 +21,12 @@ _state: dict[str, Any] = {
     "price": 0.0,
     "price_ts": 0,
 
-    # Latest kline (1m)
+    # Latest kline
     "kline": {},
-    "kline_closed": False,       # True when a 1m candle just closed
-    "kline_close_ack": True,     # main loop sets this to True after processing
+    "kline_5m_closed": False,
+    "kline_5m_close_ack": True,
+    "kline_1m_closed": False,
+    "kline_1m_close_ack": True,
 
     # Order book
     "book_bids_vol": 0.0,
@@ -62,14 +64,25 @@ def get_realtime_price() -> float:
 
 
 def is_candle_closed() -> bool:
-    """Check if a new 1m candle just closed (unacknowledged)."""
-    return _state["kline_closed"] and not _state["kline_close_ack"]
+    """Check if a 5m candle just closed (unacknowledged)."""
+    return _state["kline_5m_closed"] and not _state["kline_5m_close_ack"]
 
 
 def ack_candle_close() -> None:
-    """Acknowledge the candle close so we don't re-trigger."""
+    """Acknowledge the 5m candle close so we don't re-trigger."""
     with _lock:
-        _state["kline_close_ack"] = True
+        _state["kline_5m_close_ack"] = True
+
+
+def is_1m_candle_closed() -> bool:
+    """Check if a 1m candle just closed (for quick exit checks)."""
+    return _state["kline_1m_closed"] and not _state["kline_1m_close_ack"]
+
+
+def ack_1m_candle_close() -> None:
+    """Acknowledge the 1m candle close."""
+    with _lock:
+        _state["kline_1m_close_ack"] = True
 
 
 def get_realtime_book() -> dict:
@@ -139,10 +152,15 @@ def _on_message(ws, raw_msg: str) -> None:
             _state["price"] = float(k["c"])
             _state["price_ts"] = int(time.time() * 1000)
 
-            # Signal candle close
+            # Signal candle close by interval
+            interval = k.get("i", "")
             if k["x"]:  # candle is closed
-                _state["kline_closed"] = True
-                _state["kline_close_ack"] = False
+                if interval == "5m":
+                    _state["kline_5m_closed"] = True
+                    _state["kline_5m_close_ack"] = False
+                elif interval == "1m":
+                    _state["kline_1m_closed"] = True
+                    _state["kline_1m_close_ack"] = False
 
         # ── Aggregated trade ─────────────────────────────────────
         elif event == "aggTrade":
@@ -186,6 +204,7 @@ def _on_open(ws) -> None:
     symbol = config.SYMBOL.lower()
     streams = [
         f"{symbol}@kline_5m",
+        f"{symbol}@kline_1m",
         f"{symbol}@aggTrade",
         f"{symbol}@depth20@100ms",
     ]

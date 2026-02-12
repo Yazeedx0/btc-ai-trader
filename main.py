@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-main.py — Real-time event loop for the Claude-powered Binance Futures paper trader.
-
-Uses WebSocket streams for instant price, order book, and candle close
-detection.  Falls back to REST for historical candles & indicators.
-Claude receives ALL timeframes (1m-4h) and decides the market direction.
+main.py — Smart trading loop with:
+  - Full analysis every 5m candle close
+  - Quick exit checks every 1m candle close (when in position)
+  - Gemini manages all exits (no SL/TP on exchange)
+  - Pyramiding: Gemini can ADD to winning positions
+  - Trailing stop: Gemini tracks pnl_vs_atr and decides when to exit
 """
 
 from __future__ import annotations
 
 import signal
 import time
-import json
 import traceback
 from datetime import datetime, timezone
 
 import config
 import data
-import claude_client
+import gemini_client
 import risk
 import execution
 import logger
@@ -52,13 +52,64 @@ def close_all_positions() -> None:
         print(f"[EXIT] Error closing positions: {e}")
 
 
+def get_position_info(account: dict, atr: float) -> dict | None:
+    """Build position info dict for Claude, including pnl_vs_atr."""
+    positions = account["positions"]
+    if not positions:
+        return None
+    p = positions[0]
+    entry = p["entry_price"]
+    current = data.fetch_current_price()
+    size = p["size"]
+    side = p["side"]
+
+    # Calculate PnL in price terms
+    if side == "LONG":
+        price_pnl = current - entry
+    else:
+        price_pnl = entry - current
+
+    pnl_vs_atr = price_pnl / atr if atr > 0 else 0
+
+    return {
+        "side": side,
+        "entry_price": entry,
+        "current_price": current,
+        "size": size,
+        "leverage": p["leverage"],
+        "unrealized_pnl": p["unrealized_pnl"],
+        "pnl_vs_atr": round(pnl_vs_atr, 2),
+        "price_change": round(price_pnl, 2),
+    }
+
+
+def fetch_quick_indicators() -> tuple[dict, dict]:
+    """Fetch 1m and 5m indicators for quick check (lighter than full TF fetch)."""
+    df_1m = data.fetch_candles(interval="1m", limit=60)
+    df_1m = data.compute_indicators(df_1m)
+    ind_1m = data.extract_indicators(df_1m)
+
+    df_5m = data.fetch_candles(interval="5m", limit=60)
+    df_5m = data.compute_indicators(df_5m)
+    ind_5m = data.extract_indicators(df_5m)
+
+    return ind_1m, ind_5m
+
+
+# ── Track pyramid adds per position ─────────────────────────────────
+_pyramid_count = 0
+
+
 # ── Main loop ────────────────────────────────────────────────────────
 
 def main() -> None:
+    global _pyramid_count
+
     print_bar()
-    print("  Claude × Binance Futures — Multi-Timeframe Paper Trader")
+    print("  Gemini × Binance Futures — Smart Trailing Stop System")
     print(f"  Symbol : {config.SYMBOL}  |  Cycle : every {config.TIMEFRAME} candle")
-    print(f"  Mode   : WebSocket real-time  |  Claude chooses the timeframe")
+    print(f"  Mode   : Gemini manages ALL exits (no SL/TP on exchange)")
+    print(f"  AI     : Pro @5m (deep analysis) | Flash @1m (quick checks)")
     print(f"  Data   : 1m, 5m, 15m, 1h, 4h — full market picture")
     print_bar()
 
@@ -66,8 +117,8 @@ def main() -> None:
     if not config.BINANCE_API_KEY or not config.BINANCE_API_SECRET:
         print("[ERROR] BINANCE_API_KEY / BINANCE_API_SECRET not set. Exiting.")
         return
-    if not config.CLAUDE_API_KEY:
-        print("[ERROR] CLAUDE_API_KEY not set. Exiting.")
+    if not config.GEMINI_API_KEY:
+        print("[ERROR] GEMINI_API_KEY not set. Exiting.")
         return
 
     # Fetch starting balance once
@@ -114,17 +165,95 @@ def main() -> None:
     print_bar()
 
     cycle_count = 0
+    last_atr = 100.0  # fallback ATR
 
     while True:
         try:
-            # ── Wait for 5m candle close (real-time detection) ───────
-            rt_state = ws_stream.get_state()
-
-            # Show heartbeat every 15s while waiting
+            # ────────────────────────────────────────────────────────
+            # WAIT LOOP: Check for 5m candle close OR 1m quick check
+            # ────────────────────────────────────────────────────────
             heartbeat_ts = time.time()
-            while not ws_stream.is_candle_closed():
-                time.sleep(0.1)  # 100ms polling — near instant reaction
 
+            while True:
+                time.sleep(0.1)
+
+                # ── 5m candle closed → FULL ANALYSIS ─────────────────
+                if ws_stream.is_candle_closed():
+                    ws_stream.ack_candle_close()
+                    # Also ack any pending 1m
+                    if ws_stream.is_1m_candle_closed():
+                        ws_stream.ack_1m_candle_close()
+                    break  # → go to full analysis below
+
+                # ── 1m candle closed + we have a position → QUICK CHECK
+                if ws_stream.is_1m_candle_closed():
+                    ws_stream.ack_1m_candle_close()
+
+                    account_check = data.fetch_account_info()
+                    if account_check["positions"]:
+                        try:
+                            ind_1m, ind_5m = fetch_quick_indicators()
+                            pos_info = get_position_info(account_check, last_atr)
+
+                            if pos_info:
+                                pva = pos_info["pnl_vs_atr"]
+                                pnl = pos_info["unrealized_pnl"]
+                                side = pos_info["side"]
+
+                                print(
+                                    f"  [{ts_now()}] 🔍 1m CHECK: "
+                                    f"{side} PnL=${pnl:+.2f} "
+                                    f"({pva:+.1f}x ATR)  "
+                                    f"1m_RSI={ind_1m['rsi14']}"
+                                )
+
+                                # Ask Gemini Flash for quick check
+                                qc = gemini_client.get_quick_check(
+                                    pos_info, ind_1m, ind_5m
+                                )
+
+                                if qc and qc["action"] == "CLOSE":
+                                    print(
+                                        f"  [{ts_now()}] ⚡ QUICK CLOSE: "
+                                        f"{qc.get('comment', '')}"
+                                    )
+                                    balance_before = account_check["usdt_balance"]
+                                    close_result = execution.execute_close()
+                                    if close_result:
+                                        new_acc = data.fetch_account_info()
+                                        pnl_realized = new_acc["usdt_balance"] - balance_before
+                                        risk_mgr.record_trade_result(pnl_realized)
+                                        gemini_client.record_decision(
+                                            {"action": "CLOSE", "confidence": qc["confidence"],
+                                             "comment": f"[1m QUICK] {qc.get('comment', '')}",
+                                             "leverage": 0, "position_size_percent": 0,
+                                             "stop_loss": 0, "take_profit": 0},
+                                            pnl=pnl_realized,
+                                        )
+                                        logger.log_trade(
+                                            {"action": "CLOSE", "confidence": qc["confidence"],
+                                             "comment": f"[1m QUICK] {qc.get('comment', '')}"},
+                                            close_price=close_result["close_price"],
+                                            position_size=close_result["quantity"],
+                                            pnl=pnl_realized,
+                                            equity=new_acc["usdt_balance"],
+                                        )
+                                        _pyramid_count = 0
+                                        print(
+                                            f"  [{ts_now()}] ⚡ CLOSED @ "
+                                            f"${close_result['close_price']:.2f}  "
+                                            f"PnL: {pnl_realized:+.2f}"
+                                        )
+                                else:
+                                    if qc:
+                                        print(
+                                            f"  [{ts_now()}] ✓ HOLD: "
+                                            f"{qc.get('comment', 'holding')[:60]}"
+                                        )
+                        except Exception as e:
+                            print(f"  [{ts_now()}] [QUICK] Error: {e}")
+
+                # Heartbeat every 15 seconds
                 if time.time() - heartbeat_ts > 15:
                     rt = ws_stream.get_state()
                     flow = ws_stream.get_realtime_flow()
@@ -137,15 +266,15 @@ def main() -> None:
                     )
                     heartbeat_ts = time.time()
 
-            # ── 5m Candle closed! React immediately ──────────────────
-            ws_stream.ack_candle_close()
+            # ════════════════════════════════════════════════════════
+            # FULL 5m ANALYSIS CYCLE
+            # ════════════════════════════════════════════════════════
             cycle_count += 1
-
             print_bar()
             print(f"[{ts_now()}] ⚡ 5m CANDLE CLOSED — cycle #{cycle_count}")
             print_bar()
 
-            # ── 1. Fetch ALL timeframes (1m, 5m, 15m, 1h, 4h) ───────
+            # ── 1. Fetch ALL timeframes ──────────────────────────────
             print("[DATA] Fetching ALL timeframes (1m, 5m, 15m, 1h, 4h) …")
             try:
                 multi_tf = data.fetch_multi_timeframe()
@@ -169,43 +298,34 @@ def main() -> None:
             df = data.fetch_candles()
             df = data.compute_indicators(df)
             indicators = data.extract_indicators(df)
+            last_atr = indicators.get("atr14", 100.0)
 
             print(
                 f"[DATA] 5m: EMA9={indicators['ema9']:.2f}  "
                 f"Trend={indicators['ema_trend']}  "
                 f"RSI={indicators['rsi14']}  "
-                f"StochK={indicators.get('stoch_rsi_k', 'N/A')}  "
+                f"ATR={last_atr:.2f}  "
                 f"MACD_cross={indicators['macd_cross']}  "
-                f"BB={indicators['bb_position']}  "
-                f"VolRatio={indicators.get('vol_ratio', 'N/A')}"
+                f"BB={indicators['bb_position']}"
             )
 
             # ── 3. Market sentiment + live WS data ───────────────────
             print("[DATA] Fetching market sentiment + live WS data …")
+            market_sentiment = None
             try:
                 market_sentiment = data.fetch_market_sentiment()
-
-                # Override order book with live WS order book (more current)
                 ws_book = ws_stream.get_realtime_book()
                 if ws_book["bid_volume"] > 0:
                     market_sentiment["order_book"] = ws_book
-
-                # Add real-time trade flow
                 market_sentiment["realtime_flow"] = ws_stream.get_realtime_flow()
-
-                funding = market_sentiment["funding_rate"]["funding_rate"]
-                oi = market_sentiment["open_interest"]["open_interest"]
-                ls = market_sentiment["long_short_ratio"]["long_short_ratio"]
                 flow = market_sentiment["realtime_flow"]
                 print(
-                    f"[DATA] Funding={funding}%  OI={oi}  "
-                    f"L/S={ls}  Book={ws_book['pressure']}  "
-                    f"Flow={flow['flow']}({flow['buy_pct_10s']:.0f}%buy, "
-                    f"{flow['trade_count_10s']} trades/10s)"
+                    f"[DATA] Funding={market_sentiment['funding_rate']['funding_rate']}%  "
+                    f"Book={ws_book['pressure']}  "
+                    f"Flow={flow['flow']}({flow['buy_pct_10s']:.0f}%buy)"
                 )
             except Exception as e:
                 print(f"[DATA] Market sentiment failed: {e}")
-                market_sentiment = None
 
             # ── 4. Account state ─────────────────────────────────────
             print("[DATA] Fetching account …")
@@ -218,11 +338,28 @@ def main() -> None:
                 f"uPnL={account['unrealized_pnl']:.2f}"
             )
 
+            # Check if we have a position — add info for Claude
+            pos_info = get_position_info(account, last_atr) if positions else None
+            if pos_info:
+                print(
+                    f"[DATA] Position: {pos_info['side']} @ ${pos_info['entry_price']:.2f}  "
+                    f"PnL=${pos_info['unrealized_pnl']:+.2f}  "
+                    f"({pos_info['pnl_vs_atr']:+.1f}x ATR)  "
+                    f"Pyramids: {_pyramid_count}/{config.MAX_PYRAMID_ADDS}"
+                )
+
             recent_trades = data.fetch_recent_trades()
 
-            # ── 5. Ask Claude (with ALL timeframes + sentiment) ──────
-            print("[CLAUDE] Requesting decision (all TFs provided) …")
-            decision = claude_client.get_decision(
+            # ── 5. Ask Gemini Pro (FULL analysis) ────────────────────
+            print("[GEMINI] Requesting decision (Pro — all TFs provided) …")
+
+            # Inject position info into account for the payload
+            if pos_info:
+                account["open_position"] = pos_info
+                account["pyramid_count"] = _pyramid_count
+                account["max_pyramids"] = config.MAX_PYRAMID_ADDS
+
+            decision = gemini_client.get_decision(
                 df, account, recent_trades,
                 indicators=indicators,
                 market_sentiment=market_sentiment,
@@ -230,35 +367,33 @@ def main() -> None:
             )
 
             if decision is None:
-                print("[CLAUDE] No valid decision. Skipping.")
+                print("[GEMINI] No valid decision. Skipping.")
                 continue
-
-            print(f"[CLAUDE] → {decision['action']} "
-                  f"(conf={decision['confidence']}, "
-                  f"lev={decision['leverage']}x, "
-                  f"size={decision['position_size_percent']}%)")
-            print(f"[CLAUDE] Direction: {decision.get('market_direction', '?')}  "
-                  f"TF used: {decision.get('timeframe_used', '?')}")
-            print(f"[CLAUDE] Comment: {decision.get('comment', '')}")
 
             action = decision["action"]
+            print(f"[GEMINI] → {action} "
+                  f"(conf={decision['confidence']}, "
+                  f"lev={decision.get('leverage', 0)}x, "
+                  f"size={decision.get('position_size_percent', 0)}%)")
+            print(f"[GEMINI] Direction: {decision.get('market_direction', '?')}  "
+                  f"TF used: {decision.get('timeframe_used', '?')}")
+            print(f"[GEMINI] Comment: {decision.get('comment', '')}")
 
             # ── 6. Risk validation ───────────────────────────────────
-            allowed, reason = risk_mgr.validate(decision, balance, positions)
-            print(f"[RISK]  {reason}")
-
-            if not allowed:
-                logger.log_trade(decision, equity=balance)
-                continue
+            if action in ("BUY", "SELL"):
+                allowed, reason = risk_mgr.validate(decision, balance, positions)
+                print(f"[RISK]  {reason}")
+                if not allowed:
+                    logger.log_trade(decision, equity=balance)
+                    continue
 
             # ── 7. Execute ───────────────────────────────────────────
             if action == "HOLD":
                 print("[EXEC] HOLD — nothing to do.")
                 logger.log_trade(decision, equity=balance)
-                claude_client.record_decision(decision)
-                continue
+                gemini_client.record_decision(decision)
 
-            if action == "CLOSE":
+            elif action == "CLOSE":
                 print("[EXEC] Closing open position …")
                 close_result = execution.execute_close()
                 if close_result:
@@ -269,7 +404,7 @@ def main() -> None:
                     new_account = data.fetch_account_info()
                     pnl = new_account["usdt_balance"] - balance
                     risk_mgr.record_trade_result(pnl)
-                    claude_client.record_decision(decision, pnl=pnl)
+                    gemini_client.record_decision(decision, pnl=pnl)
                     logger.log_trade(
                         decision,
                         close_price=close_result["close_price"],
@@ -277,22 +412,51 @@ def main() -> None:
                         pnl=pnl,
                         equity=new_account["usdt_balance"],
                     )
+                    _pyramid_count = 0
                     print(f"[EXEC] Realised PnL: {pnl:+.2f} USDT")
                 else:
                     print("[EXEC] No position to close.")
                     logger.log_trade(decision, equity=balance)
-                    claude_client.record_decision(decision)
-                continue
+                    gemini_client.record_decision(decision)
 
-            if action in ("BUY", "SELL"):
+            elif action == "ADD":
+                if not positions:
+                    print("[EXEC] ADD — but no open position. Skipping.")
+                elif _pyramid_count >= config.MAX_PYRAMID_ADDS:
+                    print(f"[EXEC] ADD — max pyramids ({config.MAX_PYRAMID_ADDS}) reached.")
+                else:
+                    current_price = data.fetch_current_price()
+                    print(f"[EXEC] ADDING to position @ ~{current_price:.2f} …")
+                    try:
+                        result = execution.execute_add(decision, balance, current_price)
+                        _pyramid_count += 1
+                        print(
+                            f"[EXEC] Added: Entry={result['entry_price']:.2f}  "
+                            f"Qty={result['quantity']}  "
+                            f"(pyramid #{_pyramid_count})"
+                        )
+                        gemini_client.record_decision(decision)
+                        logger.log_trade(
+                            decision,
+                            entry_price=result["entry_price"],
+                            position_size=result["quantity"],
+                            equity=balance,
+                        )
+                    except Exception as e:
+                        print(f"[EXEC] ADD failed: {e}")
+
+            elif action in ("BUY", "SELL"):
                 current_price = data.fetch_current_price()
-                print(f"[EXEC] Opening {action} @ ~{current_price:.2f} …")
+                print(f"[EXEC] Opening {action} @ ~{current_price:.2f} "
+                      f"(Gemini manages exit — no SL/TP orders)")
                 result = execution.execute_open(decision, balance, current_price)
+                _pyramid_count = 0
                 print(
                     f"[EXEC] Entry={result['entry_price']:.2f}  "
                     f"Qty={result['quantity']}  "
                     f"Leverage={result['leverage']}x  "
-                    f"SL={result['stop_loss']:.2f}  TP={result['take_profit']:.2f}"
+                    f"Mental SL={result['stop_loss']:.2f}  "
+                    f"Mental TP={result['take_profit']:.2f}"
                 )
                 logger.log_trade(
                     decision,
@@ -303,11 +467,10 @@ def main() -> None:
                     take_profit=result["take_profit"],
                     equity=balance,
                 )
-                claude_client.record_decision(
+                gemini_client.record_decision(
                     decision,
                     entry_price=result["entry_price"],
                 )
-                continue
 
         except SystemExit:
             break

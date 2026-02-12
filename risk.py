@@ -56,7 +56,13 @@ class RiskManager:
                 f">= {config.MAX_CONSECUTIVE_LOSSES} limit."
             )
 
-        # ── Only one open position ───────────────────────────────────
+        # ── ADD (pyramiding) — position must exist ────────────────
+        if action == "ADD":
+            if not open_positions:
+                return False, "REJECTED: ADD — no open position to add to."
+            return True, "APPROVED: ADD (pyramid)."
+
+        # ── BUY/SELL — must not already have a position ──────────────
         if open_positions:
             return False, "REJECTED: already have an open position."
 
@@ -87,11 +93,8 @@ class RiskManager:
                 f"< {config.MIN_CONFIDENCE} threshold."
             )
 
-        # ── Stop-loss / take-profit sanity ───────────────────────────
-        sl = decision.get("stop_loss", 0)
-        tp = decision.get("take_profit", 0)
-        if sl <= 0 or tp <= 0:
-            return False, "REJECTED: stop_loss and take_profit must be > 0."
+        # ── SL/TP are optional now (Claude manages exits) ────────────
+        # No longer required since Claude controls all exits via 1m checks
 
         return True, "APPROVED."
 
